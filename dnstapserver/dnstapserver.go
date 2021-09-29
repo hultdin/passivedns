@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"reflect"
-	"strings"
 	"sync"
 	"time"
 
@@ -15,55 +13,55 @@ import (
 	protobuf "google.golang.org/protobuf/proto"
 )
 
-type DnstapHandler interface {
-	Handle(dnstap *dnstap.Dnstap)
+func spawn(thread func(), wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		thread()
+	}()
+}
+
+type DnstapMessageHandler interface {
+	Handle(message *dnstap.Message)
+	Close()
 }
 
 type DnstapServer interface {
-	Listen(reader io.Reader, bidrectional bool, timeout time.Duration)
-	Close()
+	Read(input io.Reader, bidrectional bool, timeout time.Duration)
+	Stop()
 	Wait()
 }
 
-func nameOf(handler DnstapHandler) string {
-	return strings.TrimLeft(reflect.TypeOf(handler).String(), "*")
+type dnstapworker struct {
+	id       int
+	handlers []DnstapMessageHandler
 }
 
-func New(workers int, queue int, handlers ...DnstapHandler) DnstapServer {
-	fmt.Fprintln(os.Stdout, "Creating Dnstap server")
-	server := &dnstapserver{wg: new(sync.WaitGroup), pipe: make(chan []byte, queue), mutex: new(sync.RWMutex), running: true, handlers: handlers}
+func (this *dnstapworker) Id() int {
+	return this.id
+}
 
-	fmt.Fprintln(os.Stdout, "Registering Dnstap handler(s)")
-	for _, handler := range handlers {
-		fmt.Fprintf(os.Stdout, "+ %s\n", nameOf(handler))
+func (this *dnstapworker) Stop() {
+	for _, handler := range this.handlers {
+		handler.Close()
 	}
-
-	fmt.Fprintf(os.Stdout, "Spawning %v Dnstap worker thread(s)\n", workers)
-	for i := 0; i < workers; i++ {
-		server.wg.Add(1)
-		go server.listen(server.pipe)
-	}
-
-	return server
 }
 
-type dnstapserver struct {
-	wg       *sync.WaitGroup
-	pipe     chan []byte
-	mutex    *sync.RWMutex
-	running  bool
-	handlers []DnstapHandler
+type DnstapWorker interface {
+	Id() int
+	Stop()
 }
 
-func (this *dnstapserver) listen(pipe <-chan []byte) {
-	defer this.wg.Done()
-
+func (this *dnstapworker) listen(pipe <-chan []byte) {
+	fmt.Fprintf(os.Stderr, "Dnstap worker %v is now listening for messages\n", this.id)
 	for frame := range pipe {
-		dnstap := &dnstap.Dnstap{}
-		if e := protobuf.Unmarshal(frame, dnstap); e == nil {
-			if this.handlers != nil && 0 < len(this.handlers) {
+		dns := dnstap.Dnstap{}
+		if e := protobuf.Unmarshal(frame, &dns); e == nil {
+			if *dns.Type == dnstap.Dnstap_MESSAGE && dns.Message != nil && this.handlers != nil && 0 < len(this.handlers) {
 				for _, handler := range this.handlers {
-					handler.Handle(dnstap)
+					if handler != nil {
+						handler.Handle(dns.Message)
+					}
 				}
 			}
 		} else {
@@ -71,7 +69,37 @@ func (this *dnstapserver) listen(pipe <-chan []byte) {
 			break
 		}
 	}
-	fmt.Fprintln(os.Stdout, "Dnstap worker thread terminated")
+	fmt.Fprintf(os.Stderr, "Dnstap %v worker thread terminated\n", this.id)
+}
+
+func New(workers int, queue int, handlers func(worker DnstapWorker) []DnstapMessageHandler) DnstapServer {
+	fmt.Fprintln(os.Stderr, "Creating Dnstap server")
+	server := &dnstapserver{wg: new(sync.WaitGroup), pipe: make(chan []byte, queue), mutex: new(sync.RWMutex), running: true, workers: make([]DnstapWorker, 0, workers)}
+
+	fmt.Fprintf(os.Stderr, "Spawning %v Dnstap worker thread(s)\n", workers)
+	for i := 0; i < workers; i++ {
+		// create worker
+		worker := &dnstapworker{id: i}
+
+		// register the message handlers
+		worker.handlers = handlers(worker)
+
+		// associate the worker with the server
+		server.workers = append(server.workers, worker)
+
+		// spawn worker and start listen for frames in the pipe
+		spawn(func() { worker.listen(server.pipe) }, server.wg)
+	}
+
+	return server
+}
+
+type dnstapserver struct {
+	wg      *sync.WaitGroup
+	mutex   *sync.RWMutex
+	running bool
+	pipe    chan []byte
+	workers []DnstapWorker
 }
 
 // MaxFrameSize sets the upper limit on input Dnstap payload (frame) sizes. If an Input
@@ -86,43 +114,40 @@ func (this *dnstapserver) listen(pipe <-chan []byte) {
 const MAXFRAMESIZE uint32 = 96 * 1024
 
 func (this *dnstapserver) redirect(reader *framestream.Reader, pipe chan<- []byte) {
-	defer this.wg.Done()
-
-	if reader != nil {
-		buffer := make([]byte, MAXFRAMESIZE)
-		for this.running {
-			if length, e := reader.ReadFrame(buffer); e == nil {
-				frame := make([]byte, length)
-				if copy(frame, buffer) != length {
-					panic(fmt.Sprintf("Something went terribly wrong, failed to copy %v bytes from the receive buffer to a Dnstap frame", length))
-				}
-
-				this.mutex.RLock()
-				if this.running {
-					// write dnstap frame to channel
-					pipe <- frame
-				}
-				this.mutex.RUnlock()
-			} else {
-				if e != io.EOF {
-					fmt.Fprintf(os.Stderr, "Dnstap listener thread encountered the following error \"%v\"\n", e)
-				}
-				break
+	buffer := make([]byte, MAXFRAMESIZE)
+	for this.running {
+		if length, e := reader.ReadFrame(buffer); e == nil {
+			frame := make([]byte, length)
+			if copy(frame, buffer) != length {
+				panic(fmt.Sprintf("Something went terribly wrong, failed to copy %v bytes from the receive buffer to a Dnstap frame", length))
 			}
+
+			this.mutex.RLock()
+			if this.running {
+				// write dnstap frame to channel
+				pipe <- frame
+			}
+			this.mutex.RUnlock()
+		} else {
+			if e != io.EOF {
+				fmt.Fprintf(os.Stderr, "Dnstap server thread encountered the following unexpected error \"%v\"\n", e)
+			}
+			break
 		}
 	}
-	fmt.Fprintln(os.Stdout, "Dnstap listener thread terminated")
+	fmt.Fprintln(os.Stderr, "Dnstap server thread terminated")
 }
 
-func (this *dnstapserver) Listen(reader io.Reader, bidirectional bool, timeout time.Duration) {
+const CONTENT_TYPE_PROTOBUF_DNSTAP = "protobuf:dnstap.Dnstap"
+
+func (this *dnstapserver) Read(input io.Reader, bidirectional bool, timeout time.Duration) {
 	this.mutex.RLock()
 	defer this.mutex.RUnlock()
 
 	if this.running {
-		if stream, e := framestream.NewReader(reader, &framestream.ReaderOptions{ContentTypes: [][]byte{[]byte("protobuf:dnstap.Dnstap")}, Bidirectional: bidirectional, Timeout: timeout}); e == nil {
-			fmt.Fprintln(os.Stdout, "Spawning Dnstap listener thread")
-			this.wg.Add(1)
-			go this.redirect(stream, this.pipe)
+		if stream, e := framestream.NewReader(input, &framestream.ReaderOptions{ContentTypes: [][]byte{[]byte(CONTENT_TYPE_PROTOBUF_DNSTAP)}, Bidirectional: bidirectional, Timeout: timeout}); e == nil {
+			fmt.Fprintln(os.Stderr, "Spawning Dnstap server thread")
+			spawn(func() { this.redirect(stream, this.pipe) }, this.wg)
 		} else {
 			panic(e)
 		}
@@ -131,16 +156,23 @@ func (this *dnstapserver) Listen(reader io.Reader, bidirectional bool, timeout t
 	}
 }
 
-func (this *dnstapserver) Close() {
+func (this *dnstapserver) Stop() {
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
 
 	if this.running {
+		fmt.Fprintln(os.Stderr, "Stopping the Dnstap server")
+
+		for _, worker := range this.workers {
+			worker.Stop()
+		}
+
 		this.running = false
-		fmt.Fprintln(os.Stdout, "Closing the Dnstap server")
+
 		close(this.pipe)
-		this.pipe = nil
-		fmt.Fprintln(os.Stdout, "Dnstap server closed")
+		//this.pipe = nil
+
+		fmt.Fprintln(os.Stderr, "Dnstap server stopped")
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -8,19 +9,20 @@ import (
 	"os"
 	"os/signal"
 	"passivedns/dnstapserver"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
 )
 
 // Version is current version of this program.
-var version = v{1, 0, 6, 24}
+var version = Version{1, 7, 8, 4}
 
-type v struct {
+type Version struct {
 	Major, Minor, Patch, Build int
 }
 
-func (this v) String() string {
+func (this Version) String() string {
 	return fmt.Sprintf("%d.%d.%d", this.Major, this.Minor, this.Patch)
 }
 
@@ -34,13 +36,13 @@ func fatalln(a interface{}) {
 	os.Exit(1)
 }
 
-func hook(callback func(), signals ...os.Signal) {
+func hook(callback func(signal os.Signal), signals ...os.Signal) {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, signals...)
-	go func(signals <-chan os.Signal, callback func()) {
-		<-signals
-		callback()
-		os.Exit(0)
+	go func(signals <-chan os.Signal, callback func(signal os.Signal)) {
+		for {
+			callback(<-signals)
+		}
 	}(c, callback)
 }
 
@@ -49,14 +51,18 @@ func address(file string) (string, string) {
 		if fstat.Mode().Type() == fs.ModeSocket {
 			os.Remove(file)
 		} else {
-			fatalf("\"%v\" exists and is not a Unix socket", file)
+			fatalf("\"%v\" exists and is not a Unix socket\n", file)
+		}
+	} else {
+		if _, e := os.Stat(filepath.Dir(file)); e != nil {
+			fatalf("\"%v\" invalid path\n", filepath.Dir(file))
 		}
 	}
 	return "unix", file
 }
 
 type arguments struct {
-	file   *string
+	input  *string
 	text   *bool
 	json   *bool
 	sqlite *string
@@ -64,31 +70,31 @@ type arguments struct {
 
 func parse() arguments {
 	arguments := arguments{
-		file:   flag.String("socket", "", "Path to DNStap Unix socket"),
+		input:  flag.String("input", "", "Path to DNStap Unix socket"),
 		text:   flag.Bool("text", false, "Use text formatted output"),
 		json:   flag.Bool("json", false, "Use verbose JSON formatted output"),
 		sqlite: flag.String("sqlite", "", "Write to SQLite3 database")}
 
 	flag.Parse()
 
-	if *arguments.file == "" || len(*arguments.file) == 0 {
-		fatalln("Missing argument -socket <path>")
+	if *arguments.input == "" || len(*arguments.input) == 0 {
+		fatalln("Missing argument -input <file>")
 	}
 
 	return arguments
 }
 
-func handlers(arguments arguments) []dnstapserver.DnstapHandler {
-	handlers := []dnstapserver.DnstapHandler{}
+func handlers(worker dnstapserver.DnstapWorker, arguments arguments) []dnstapserver.DnstapMessageHandler {
+	handlers := []dnstapserver.DnstapMessageHandler{}
 
 	if *arguments.text {
-		handlers = append(handlers, NewTextDnstapHander())
+		handlers = append(handlers, NewTextWriterHander(os.Stdout))
 	}
 	if *arguments.json {
-		handlers = append(handlers, NewResolverResponseJsonDnstapHander())
+		handlers = append(handlers, NewResolverResponseJsonMessageHandler(os.Stdout))
 	}
 	if *arguments.sqlite != "" && 0 < len(*arguments.sqlite) {
-		handlers = append(handlers, NewResolverResponseSqliteDnstapHandler(*arguments.sqlite))
+		handlers = append(handlers, NewResolverResponseSqliteMessageHandler(*arguments.sqlite, 32))
 	}
 
 	/*
@@ -100,41 +106,59 @@ func handlers(arguments arguments) []dnstapserver.DnstapHandler {
 	return handlers
 }
 
+func socket(file string) bool {
+	if fstat, e := os.Stat(file); e == nil {
+		return fstat.Mode().Type() == fs.ModeSocket
+	}
+	return true
+}
+
+func run(server dnstapserver.DnstapServer, file string, timeout time.Duration) {
+	if socket(file) {
+		// read DNStap frames from a Unix socket
+		if socket, e := net.Listen(address(file)); e == nil {
+			defer socket.Close()
+			fmt.Fprintf(os.Stderr, "Unix socket \"%v\" successfully created, waiting for connections\n", file)
+			for {
+				if connection, e := socket.Accept(); e == nil {
+					fmt.Fprintln(os.Stderr, "Connection to socket accepted")
+					server.Read(connection, true, timeout)
+					fmt.Fprintln(os.Stderr, "Dnstap server is now listening on the established connection")
+				} else {
+					fmt.Fprintln(os.Stderr, e)
+				}
+			}
+		} else {
+			fmt.Fprintln(os.Stderr, e)
+		}
+	} else {
+		// read DNStap frames from a regular file
+		if reader, e := os.Open(file); e == nil {
+			defer reader.Close()
+
+			server.Read(bufio.NewReader(reader), false, 0)
+		}
+		//time.Sleep(5 * time.Second)
+	}
+
+}
+
 func main() {
-	fmt.Fprintf(os.Stdout, "PassiveDNS v%s (%v)\n", version, runtime.Version())
+	fmt.Fprintf(os.Stderr, "PassiveDNS v%s (%v)\n", version, runtime.Version())
 
 	arguments := parse()
 
 	// create the server and spawn worker threads
-	server := dnstapserver.New(runtime.NumCPU(), 8*runtime.NumCPU(), handlers(arguments)...)
+	server := dnstapserver.New(runtime.NumCPU(), 8*runtime.NumCPU(), func(worker dnstapserver.DnstapWorker) []dnstapserver.DnstapMessageHandler {
+		return handlers(worker, arguments)
+	})
 
-	// close server on SIGKILL, SIGTERM, and SIGINT
-	hook(func() { server.Close() }, syscall.SIGKILL, syscall.SIGTERM, syscall.SIGINT)
+	// stop server on SIGKILL, SIGTERM, and SIGINT
+	hook(func(signal os.Signal) { server.Stop() }, syscall.SIGKILL, syscall.SIGTERM, syscall.SIGINT)
 
-	if socket, e := net.Listen(address(*arguments.file)); e == nil {
-		defer socket.Close()
-		fmt.Fprintf(os.Stdout, "Unix socket \"%v\" successfully opened, waiting for connections\n", *arguments.file)
-		for {
-			if connection, e := socket.Accept(); e == nil {
-				fmt.Fprintln(os.Stdout, "Connection to socket accepted, server is now listening on the established connection")
-				server.Listen(connection, true, 10*time.Second)
-			} else {
-				fmt.Fprintln(os.Stderr, e)
-			}
-		}
-	} else {
-		fmt.Fprintln(os.Stderr, e)
-	}
+	// run the server with the given arguments
+	go run(server, *arguments.input, 15*time.Second)
 
-	/*
-		filename := "/home/magnus/dnstap.protobuf"
-		if reader, e := os.Open(filename); e == nil {
-			defer reader.Close()
-
-			server.Listen(bufio.NewReader(reader), false, 0)
-		}
-
-		server.Wait()
-		server.Close()
-	*/
+	// wait for the server to finish
+	server.Wait()
 }
